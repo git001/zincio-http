@@ -1,5 +1,11 @@
 # `zincio-http` change log
 
+## `zincio-http` UNRELEASED
+
+**Not yet released**
+
+- Fixed HTTP/2 request handlers not being dropped when the client resets the stream (`RST_STREAM`) or closes the connection before the response, so a handler waiting for a backend never learned that the client left.
+
 ## `zincio-http` 0.4.17
 
 **Released in November 11, 2026**

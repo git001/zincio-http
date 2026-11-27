@@ -24,7 +24,7 @@ pin_project! {
     /// connection can drop its per-stream state.
     pub(crate) struct StreamDriver<Fut, ResB> {
         msg_tx: kanal::AsyncSender<StreamMsg>,
-        reset_rx: kanal::AsyncReceiver<u32>,
+        reset_rx: super::reset::ResetReceiver,
         // Pokes the connection's drive loop when a message lands in
         // the channel, so responses are delivered even while the peer
         // idles.
@@ -82,7 +82,7 @@ impl<Fut, ResB> StreamDriver<Fut, ResB> {
     #[inline]
     pub(crate) fn new(
         response_fut: Fut,
-        reset_rx: kanal::AsyncReceiver<u32>,
+        reset_rx: super::reset::ResetReceiver,
         msg_tx: kanal::AsyncSender<StreamMsg>,
         wake_tx: kanal::AsyncSender<()>,
         early_hints_rx: EarlyHintsReceiver,
@@ -280,7 +280,7 @@ where
         msg_tx: &mut kanal::AsyncSender<StreamMsg>,
         wake_tx: &kanal::AsyncSender<()>,
         mut msg_tx_fut: Pin<&mut Option<kanal::SendFuture<'static, StreamMsg>>>,
-        reset_rx: &mut kanal::AsyncReceiver<u32>,
+        reset_rx: &mut super::reset::ResetReceiver,
         mut response_fut: Pin<&mut Fut>,
         mut early_hints_rx: Pin<&mut EarlyHintsReceiver>,
         response_done: &mut bool,
@@ -382,9 +382,10 @@ where
                 *response_done = true;
                 continue;
             }
-            match std::pin::pin!(reset_rx.recv()).poll(cx) {
-                Poll::Ready(_) => return ServicePoll::Done,
-                Poll::Pending => {}
+            // Reset by the peer, or dropped by the connection: the handler
+            // is dropped with the task.
+            if reset_rx.poll_reset(cx).is_ready() {
+                return ServicePoll::Done;
             }
             if *send_continue
                 && !*continue_sent
@@ -511,7 +512,7 @@ where
     fn poll_body(
         msg_tx: &mut kanal::AsyncSender<StreamMsg>,
         mut msg_tx_fut: Pin<&mut Option<kanal::SendFuture<'static, StreamMsg>>>,
-        reset_rx: &mut kanal::AsyncReceiver<u32>,
+        reset_rx: &mut super::reset::ResetReceiver,
         wake_tx: &kanal::AsyncSender<()>,
         headers: &mut Option<http::response::Parts>,
         first_frame: &mut Option<http_body::Frame<Bytes>>,
@@ -550,9 +551,8 @@ where
                 return Poll::Ready(());
             }
 
-            match std::pin::pin!(reset_rx.recv()).poll(cx) {
-                Poll::Ready(_) => return Poll::Ready(()),
-                Poll::Pending => {}
+            if reset_rx.poll_reset(cx).is_ready() {
+                return Poll::Ready(());
             }
             let poll_frame = if let Some(frame) = first_frame.take() {
                 Poll::Ready(Some(Ok(frame)))

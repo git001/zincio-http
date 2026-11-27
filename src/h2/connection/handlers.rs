@@ -129,7 +129,7 @@ where
         // because every send wakes the drive loop, which drains it.
         // Larger bounds only preallocate memory per stream (heap profiles
         // showed ~76 MiB across 38k streams for 32/16).
-        let (reset_tx, reset_rx) = kanal::bounded_async(1);
+        let (reset_tx, reset_rx) = crate::h2::stream::reset::channel();
         let (msg_tx, msg_rx) = kanal::bounded_async(8);
 
         let timeout_fut = if let Some(timeout) = self.header_read_timeout {
@@ -550,9 +550,9 @@ where
         // Unblock the task: the body reader reports the reset and the
         // task ends. Dropping the entry also severs the message
         // channel, which finishes the task if it was parked.
-        if !entry.remote_ended {
-            entry.send_reset(error_code);
-        }
+        // Also when the request body has ended: the handler of a GET, say,
+        // may still be running, and is dropped.
+        entry.send_reset(error_code);
     }
 
     #[inline]

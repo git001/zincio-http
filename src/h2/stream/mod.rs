@@ -87,8 +87,9 @@ pub(crate) struct StreamEntry {
     /// `None` when the request ended with HEADERS (typical GET): no body
     /// frames can arrive, so no channel is allocated at all.
     pub(crate) body_tx: Option<kanal::AsyncSender<BodyMsg>>,
-    /// Peer RST_STREAM notifications (receiver lives in the task).
-    pub(crate) reset_tx: kanal::AsyncSender<u32>,
+    /// Peer RST_STREAM notifications (receiver lives in the task);
+    /// dropping it tells the task the stream is gone.
+    pub(crate) reset_tx: reset::ResetSender,
     /// Outbound response messages (sender lives in the task).
     pub(crate) msg_rx: kanal::AsyncReceiver<StreamMsg>,
     /// Driver's sender clone; moved out when the task spawns.
@@ -97,7 +98,7 @@ pub(crate) struct StreamEntry {
     /// spawns (the H2Body hands it to the user).
     pub(crate) body_rx: Option<kanal::AsyncReceiver<BodyMsg>>,
     /// Receiver half for peer resets; moved out when the task spawns.
-    pub(crate) reset_rx: Option<kanal::AsyncReceiver<u32>>,
+    pub(crate) reset_rx: Option<reset::ResetReceiver>,
     /// Wakes the drive loop when the task's channel is full.
     pub(crate) wake_tx: Option<kanal::AsyncSender<()>>,
     /// Field block fragments between HEADERS and END_HEADERS.
@@ -149,7 +150,7 @@ pub(crate) struct StreamEntry {
 impl StreamEntry {
     #[inline]
     pub(crate) fn new(
-        reset_tx: kanal::AsyncSender<u32>,
+        reset_tx: reset::ResetSender,
         msg_rx: kanal::AsyncReceiver<StreamMsg>,
         header_timeout_cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Self {
@@ -206,7 +207,7 @@ impl StreamEntry {
 
     #[inline]
     pub(crate) fn send_reset(&self, code: u32) {
-        let _ = self.reset_tx.try_send(code);
+        self.reset_tx.send(code);
     }
 }
 
@@ -578,6 +579,7 @@ pub(crate) fn parse_trailers(headers: &[Header]) -> Result<HeaderMap, MalformedR
 
 pub(crate) use service::StreamDriver;
 
+pub(crate) mod reset;
 mod service;
 
 #[cfg(test)]
