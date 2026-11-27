@@ -5,6 +5,7 @@
 **Not yet released**
 
 - Fixed HTTP/2 request handlers not being dropped when the client resets the stream (`RST_STREAM`) or closes the connection before the response, so a handler waiting for a backend never learned that the client left.
+- The HTTP/1.x server can now drop the request handler when the client closes the connection before the response (`Http1Options::client_eof_ends_request`, disabled by default), as the HTTP/2 server does for a reset stream.
 
 ## `zincio-http` 0.4.17
 

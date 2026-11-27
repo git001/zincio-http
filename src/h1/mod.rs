@@ -487,6 +487,13 @@ where
             let upgraded = upgrade.upgraded.clone();
             request.extensions_mut().insert(upgrade);
 
+            // Watches the connection once the request body is read, so a
+            // client that leaves before the response drops the handler.
+            // Safety: used only after the body has been read, while the
+            // handler runs; then nothing else reads from the connection, and
+            // the early hints future only writes, as above.
+            let watch_self = unsafe { std::mem::transmute::<&mut Self, &mut Self>(&mut self) };
+
             let mut continue_sent = false;
             let mut response = {
                 let read_body_fut = async {
@@ -523,13 +530,37 @@ where
                 let (response, body_fut) = match select_either {
                     futures_util::future::Either::Left((result, request_fut)) => {
                         result?;
-                        (
-                            match request_fut.await {
-                                futures_util::future::Either::Left((response, _)) => response,
-                                futures_util::future::Either::Right((_, _)) => unreachable!(),
-                            },
-                            None,
-                        )
+                        let watch = watch_self.options.client_eof_ends_request;
+                        // The client sends nothing more for this request:
+                        // the end of the connection now means it left, and
+                        // the handler is dropped, as for a reset HTTP/2
+                        // stream. A pipelined request stays in the buffer
+                        // for the next round, and the watch ends.
+                        let client_left = async {
+                            if !watch {
+                                futures_util::future::pending::<()>().await;
+                            }
+                            match watch_self.fill_buf().await {
+                                Ok(0) => {}
+                                Ok(read) => {
+                                    debug_assert!(read > 0);
+                                    futures_util::future::pending::<()>().await;
+                                }
+                                // A failed read is a client that is gone too.
+                                Err(err) => drop(err),
+                            }
+                        };
+                        let client_left = std::pin::pin!(client_left);
+                        match futures_util::future::select(request_fut, client_left).await {
+                            futures_util::future::Either::Left((answered, _)) => (
+                                match answered {
+                                    futures_util::future::Either::Left((response, _)) => response,
+                                    futures_util::future::Either::Right((_, _)) => unreachable!(),
+                                },
+                                None,
+                            ),
+                            futures_util::future::Either::Right(((), _)) => return Ok(()),
+                        }
                     }
                     futures_util::future::Either::Right((response, read_body_fut)) => (
                         match response {
