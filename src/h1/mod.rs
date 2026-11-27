@@ -70,6 +70,8 @@ pub struct Http1<Io> {
     response_head_buf: Vec<u8>,
     write_buf: WriteBuf,
     connection_idle: bool,
+    /// Bytes of the current request chunk still to be read.
+    chunk_remaining: usize,
 }
 
 #[cfg(all(
@@ -155,6 +157,7 @@ where
             response_head_buf: Vec::with_capacity(1024),
             write_buf: WriteBuf::new(),
             connection_idle: false,
+            chunk_remaining: 0,
         }
     }
 

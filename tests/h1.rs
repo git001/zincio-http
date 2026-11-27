@@ -658,6 +658,118 @@ async fn test_chunked_encoding_very_large() {
     .await;
 }
 
+#[tokio::test]
+async fn test_chunked_request_over_the_default_chunk_size() {
+    on_local(async {
+        let data = "a".repeat(4097);
+        // The whole request fits into the pipe: the server fails the
+        // connection at the chunk size, before the client has written all.
+        let (response, result) = round_trip_with(
+            1 << 16,
+            Http1Options::new().header_read_timeout(None),
+            |req| async {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                Ok::<_, http::Error>(http::Response::new(Full::new(body)))
+            },
+            format!(
+                "POST / HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{data}\r\n0\r\n\r\n",
+                data.len()
+            )
+            .as_bytes(),
+        )
+        .await;
+
+        assert!(!response.starts_with(b"HTTP/1.0 200 "), "{response:?}");
+        assert_eq!(result.unwrap_err().to_string(), "invalid chunk length");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_chunked_request_max_chunk_size_allows_larger_chunks() {
+    on_local(async {
+        // curl sends a body of unknown length in chunks of 64 KiB.
+        let data = vec![b'a'; 64 * 1024];
+        let mut request = format!(
+            "POST / HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n",
+            data.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&data);
+        request.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (response, result) = round_trip_with(
+            4096,
+            Http1Options::new()
+                .header_read_timeout(None)
+                .max_chunk_size(64 * 1024),
+            |req| async {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                Ok::<_, http::Error>(http::Response::new(Full::new(Bytes::from(
+                    body.len().to_string(),
+                ))))
+            },
+            &request,
+        )
+        .await;
+
+        assert!(response.starts_with(b"HTTP/1.0 200 OK\r\n"));
+        assert!(response.ends_with(b"65536"));
+        result.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_chunked_request_passed_on_before_the_chunk_is_complete() {
+    on_local(async {
+        let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (client_io, server_task) = start_with(
+            1 << 16,
+            Http1Options::new()
+                .header_read_timeout(None)
+                .max_chunk_size(0x100000),
+            move |req| {
+                let first_tx = first_tx.clone();
+                async move {
+                    let mut body = req.into_body();
+                    let first = body.frame().await.unwrap().unwrap();
+                    first_tx.send(first.data_ref().unwrap().len()).unwrap();
+                    let rest = body.collect().await.unwrap().to_bytes();
+                    Ok::<_, http::Error>(http::Response::new(Full::new(Bytes::from(
+                        rest.len().to_string(),
+                    ))))
+                }
+            },
+        )
+        .await;
+        let (mut reader, mut writer) = tokio::io::split(client_io);
+        // A chunk of 1 MiB, of which only the first 1000 bytes are sent.
+        writer
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n100000\r\n",
+            )
+            .await
+            .unwrap();
+        writer.write_all(&[b'a'; 1000]).await.unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), first_rx.recv())
+            .await
+            .expect("no data before the chunk was complete")
+            .unwrap();
+        assert!((1..=1000).contains(&first), "{first}");
+
+        writer.write_all(&vec![b'a'; 0x100000 - 1000]).await.unwrap();
+        writer.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        reader.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200 "), "{text:?}");
+        assert!(text.ends_with(&(0x100000 - first).to_string()), "{text:?}");
+        server_task.await.unwrap().unwrap();
+    })
+    .await;
+}
+
 #[test]
 fn test_slowloris() {
     // The timer comes from the zincio runtime, not Tokio.

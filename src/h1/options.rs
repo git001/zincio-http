@@ -15,6 +15,7 @@
 pub struct Http1Options {
     pub(crate) max_header_size: usize,
     pub(crate) max_header_count: usize,
+    pub(crate) max_chunk_size: usize,
     pub(crate) send_date_header: bool,
     pub(crate) header_read_timeout: Option<std::time::Duration>,
     pub(crate) send_continue_response: bool,
@@ -29,6 +30,7 @@ impl Http1Options {
     /// |---|---|
     /// | `max_header_size` | 16 384 bytes |
     /// | `max_header_count` | 128 |
+    /// | `max_chunk_size` | 4 096 bytes |
     /// | `send_date_header` | `true` |
     /// | `header_read_timeout` | 30 seconds |
     /// | `send_continue_response` | `true` |
@@ -38,6 +40,7 @@ impl Http1Options {
         Self {
             max_header_size: 16384,
             max_header_count: 128,
+            max_chunk_size: 4096,
             send_date_header: true,
             header_read_timeout: Some(std::time::Duration::from_secs(30)),
             send_continue_response: true,
@@ -53,6 +56,18 @@ impl Http1Options {
     /// `InvalidData` I/O error. Defaults to **16 384** bytes.
     pub fn max_header_size(mut self, size: usize) -> Self {
         self.max_header_size = size;
+        self
+    }
+
+    /// Sets the maximum size of one chunk of a chunked request body.
+    ///
+    /// Larger chunks fail the body with an `InvalidData` I/O error. A chunk
+    /// is passed on as it arrives, not held in memory whole, so the size of
+    /// a chunk does not bound memory use and the limit can be raised for
+    /// clients that send larger chunks (curl sends 64 KiB). Defaults to
+    /// **4 096** bytes.
+    pub fn max_chunk_size(mut self, size: usize) -> Self {
+        self.max_chunk_size = size;
         self
     }
 

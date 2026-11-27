@@ -106,6 +106,11 @@ where
         continue_sent: &mut bool,
         version: Version,
     ) -> Result<bytes::Bytes, std::io::Error> {
+        if self.chunk_remaining > 0 {
+            return self
+                .read_chunk_data(send_continue_body, continue_sent, version)
+                .await;
+        }
         let len = {
             let mut len_buf_pos: usize = 0;
             let mut just_started = true;
@@ -157,8 +162,7 @@ where
                     let len = usize::from_str_radix(numbers, 16).map_err(|_| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid chunk length")
                     })?;
-                    if len > 4096 {
-                        // Similar limit to net/http in Go
+                    if len > self.options.max_chunk_size {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             "invalid chunk length",
@@ -171,51 +175,88 @@ where
                 }
             }
         };
-        let mut read = 0;
-        if len == 0 && would_have_trailers {
+        if len == 0 {
+            if !would_have_trailers {
+                // The CRLF that ends the body stays in the buffer for the
+                // trailer parser.
+                while self.read_buf.len() < 2 {
+                    self.fill_chunk_buf(send_continue_body, continue_sent, version)
+                        .await?;
+                }
+            }
             return Ok(bytes::Bytes::new()); // Empty terminating chunk
         }
-        let mut just_started = true;
-        // + 2, because we need to read the trailing CRLF
-        let Some(len_plus_two) = len.checked_add(2) else {
+        // The data and the CRLF after it must be countable.
+        if len.checked_add(2).is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "chunk length too large",
             ));
-        };
-        while read < len_plus_two {
-            let have_to_read_buf = !just_started || self.read_buf.is_empty();
-            just_started = false;
-            if have_to_read_buf {
-                if !*continue_sent
-                    && send_continue_body
-                        .as_ref()
-                        .is_some_and(|signal| signal.is_wanted())
-                {
-                    *continue_sent = true;
-                    self.write_100_continue(version).await?;
-                }
-                let Some(n) = self.fill_buf_or_wanted(send_continue_body).await? else {
-                    continue;
-                };
-                if n == 0 {
+        }
+        self.chunk_remaining = len;
+        self.read_chunk_data(send_continue_body, continue_sent, version)
+            .await
+    }
+
+    /// The next part of the current chunk, as much of it as has arrived,
+    /// so that a chunk is never held in memory whole; once the chunk is
+    /// complete, the CRLF after it is skipped too.
+    #[inline]
+    async fn read_chunk_data(
+        &mut self,
+        send_continue_body: &Option<Arc<ContinueSignal>>,
+        continue_sent: &mut bool,
+        version: Version,
+    ) -> Result<bytes::Bytes, std::io::Error> {
+        while self.read_buf.is_empty() {
+            self.fill_chunk_buf(send_continue_body, continue_sent, version)
+                .await?;
+        }
+        let part = self
+            .read_buf
+            .split_to(self.read_buf.len().min(self.chunk_remaining))
+            .freeze();
+        self.chunk_remaining -= part.len();
+        if self.chunk_remaining == 0 {
+            // Ignore the trailing CRLF
+            while self.read_buf.len() < 2 {
+                self.fill_chunk_buf(send_continue_body, continue_sent, version)
+                    .await?;
+            }
+            self.read_buf.advance(2);
+        }
+        Ok(part)
+    }
+
+    /// Reads more of a chunked body, sending `100 Continue` first if it is
+    /// wanted; EOF is an error.
+    #[inline]
+    async fn fill_chunk_buf(
+        &mut self,
+        send_continue_body: &Option<Arc<ContinueSignal>>,
+        continue_sent: &mut bool,
+        version: Version,
+    ) -> Result<(), std::io::Error> {
+        loop {
+            if !*continue_sent
+                && send_continue_body
+                    .as_ref()
+                    .is_some_and(|signal| signal.is_wanted())
+            {
+                *continue_sent = true;
+                self.write_100_continue(version).await?;
+            }
+            match self.fill_buf_or_wanted(send_continue_body).await? {
+                None => continue,
+                Some(0) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "unexpected EOF",
-                    ));
+                    ))
                 }
-                read += n;
-            } else {
-                read += self.read_buf.len();
+                Some(_) => return Ok(()),
             }
         }
-        let chunk = self.read_buf.split_to(len).freeze();
-        if !chunk.is_empty() {
-            // Ignore the trailing CRLF, except for terminating chunks
-            // (this could interfere with trailers)
-            self.read_buf.advance(2);
-        }
-        Ok(chunk)
     }
 
     #[inline]
